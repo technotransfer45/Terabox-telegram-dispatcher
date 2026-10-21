@@ -1,9 +1,10 @@
 import os
 import re
+import json
 import asyncio
 import logging
 import sqlite3
-from html import escape
+from html import escape, unescape
 
 import httpx
 from aiohttp import web
@@ -30,7 +31,7 @@ def parse_chat_id(raw):
     raise ValueError(f"Invalid chat id: {raw!r}")
 
 
-def clean_channel_id(raw) -> str:
+def clean_uk(raw) -> str:
     return re.sub(r"[^\d]", "", str(raw))
 
 
@@ -43,25 +44,30 @@ ADULT_CHANNEL = parse_chat_id(os.environ["ADULT_CHANNEL"])
 LOG_CHANNEL = parse_chat_id(os.environ["LOG_CHANNEL"])
 PORT = int(os.environ.get("PORT", 8080))
 
+# Each entry in TARGET_CHANNELS is used as the Hive `bot_uk`
 _raw = os.environ.get("TARGET_CHANNELS", "").strip()
-TARGET_CHANNELS = [clean_channel_id(c) for c in _raw.split(",") if clean_channel_id(c)] or ["4402319592370"]
+TARGET_CHANNELS = [clean_uk(c) for c in _raw.split(",") if clean_uk(c)] or ["4402319592370"]
 
-CHANNEL_API_URL = os.environ.get(
-    "CHANNEL_API_URL", "https://dm.nephobox.com/api/channel/share/msglist"
-)
-BOT_UK = os.environ.get("BOT_UK", "").strip()  # optional; falls back to channel_id
+HIVE_URL = os.environ.get("HIVE_URL", "https://dm.nephobox.com/wap/hive/channelShare")
 SHARE_LIST_URL = "https://www.terabox.com/share/list"
 APP_ID = "250528"
 
 CHECK_INTERVAL = 15 * 60
-MAX_PAGES = int(os.environ.get("MAX_PAGES", 500))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", 200))
 MAX_DEPTH = 6
 MAX_FILES = 300
 DB_PATH = "processed.db"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+PAGE_HEADERS = {
+    "User-Agent": UA,
+    "Referer": "https://dm.nephobox.com/wap/hive/channelShare",
+    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+API_HEADERS = {
+    "User-Agent": UA,
     "Referer": "https://dm.nephobox.com/wap/hive/channelShare",
     "Accept": "application/json, text/plain, */*",
 }
@@ -80,13 +86,23 @@ MOVIE_KEYWORDS = [
 MOVIE_REGEXES = [re.compile(r"\bs\d{1,2}(e\d{1,2})?\b", re.I)]
 
 LINK_RE = re.compile(
-    r"https?://(?:www\.)?(?:terabox|teraboxapp|nephobox|1024tera|4funbox|mirrobox|momerybox|"
-    r"teraboxlink|terafileshare|1024terabox|terasharelink)\.[a-z]+/(?:s/|sharing/link\?surl=)([\w-]+)",
+    r"https?://(?:[\w-]+\.)*(?:terabox|teraboxapp|nephobox|1024tera|1024terabox|4funbox|mirrobox|"
+    r"momerybox|teraboxlink|terafileshare|terasharefile|terasharelink|tibibox|freeterabox)"
+    r"\.[a-z]+/(?:s/|sharing/link\?surl=)([\w-]+)",
     re.I,
 )
 VIDEO_EXT = (".mp4", ".mkv")
 
-BOT_HTTP: httpx.AsyncClient | None = None
+STATE_ASSIGN_RE = re.compile(
+    r"window\.__(?:INITIAL_STATE|PRELOADED_STATE|NUXT|APP_STATE|DATA)__\s*=\s*", re.I
+)
+JSON_SCRIPT_RE = re.compile(
+    r"<script[^>]*type=[\"']application/(?:json|ld\+json)[\"'][^>]*>(.*?)</script>", re.S | re.I
+)
+NOT_FOUND_MARKERS = ("can’t find the page", "can't find the page", "page not found")
+
+BOT_HTTP = None
+PYRO_OK = set()  # chat ids Pyrogram could resolve
 
 
 # ---------------- DATABASE ----------------
@@ -118,94 +134,202 @@ async def start_web():
     log.info("Health server on port %s", PORT)
 
 
-# ---------------- HTTP / SCRAPING ----------------
-async def safe_get(http: httpx.AsyncClient, url: str, params: dict):
-    """GET with retries. Returns (parsed_json_or_None, raw_text)."""
-    text = ""
+# ---------------- PAGE FETCH + PARSING ----------------
+async def fetch_page(http: httpx.AsyncClient, bot_uk: str, page: int, cursor):
+    """Fetch the Hive channel page (or its paginated variant). Returns text or None."""
+    params = {"bot_uk": bot_uk}
+    if page > 1:
+        params["page"] = page
+    if cursor:
+        params["cursor"] = cursor
+    headers = dict(PAGE_HEADERS)
+    if page > 1:
+        headers["X-Requested-With"] = "XMLHttpRequest"
     for attempt in range(3):
         try:
-            res = await http.get(url, params=params, headers=HEADERS)
+            res = await http.get(HIVE_URL, params=params, headers=headers)
             text = res.text or ""
-            if res.status_code == 200 and text.strip().startswith(("{", "[")):
-                try:
-                    return res.json(), text
-                except ValueError as e:
-                    log.warning("JSON decode failed: %s", e)
-            elif res.status_code == 200:
-                log.warning("Non-JSON response (%s chars) from %s: %r",
-                            len(text), url, text[:120])
-                return None, text  # HTML/empty: no point retrying
-            else:
-                log.warning("HTTP %s from %s", res.status_code, url)
+            log.info("GET %s page=%s -> HTTP %s, %s chars", HIVE_URL, page, res.status_code, len(text))
+            if res.status_code == 200 and text.strip():
+                low = text[:3000].lower()
+                if any(m in low for m in NOT_FOUND_MARKERS):
+                    log.error("Hive returned 'page not found' for bot_uk=%s. "
+                              "Check that bot_uk is correct and the channel page is public.", bot_uk)
+                    return None
+                return text
+            if res.status_code in (403, 404):
+                log.error("HTTP %s for bot_uk=%s", res.status_code, bot_uk)
+                return None
         except Exception as e:
-            log.warning("Request failed (%s): %s", attempt + 1, e)
+            log.warning("Page request failed (%s): %s", attempt + 1, e)
         await asyncio.sleep(2 * (attempt + 1))
-    return None, text
+    return None
 
 
-def extract_posts(data):
-    """Return (posts, next_cursor) from a flexible response shape."""
-    if isinstance(data, list):
-        return [p for p in data if isinstance(p, dict)], None
-    if not isinstance(data, dict):
-        return [], None
-    payload = data.get("data") if isinstance(data.get("data"), dict) else data
-    posts = None
-    for k in ("list", "msglist", "msg_list", "posts", "items", "data"):
-        if isinstance(payload.get(k), list):
-            posts = payload[k]
-            break
-    if posts is None and isinstance(data.get("list"), list):
-        posts = data["list"]
-    cursor = None
-    for k in ("cursor", "next_cursor", "next", "offset"):
-        if payload.get(k):
-            cursor = payload[k]
-            break
-    has_more = payload.get("has_more", payload.get("hasmore", 1 if cursor else 0))
-    return [p for p in (posts or []) if isinstance(p, dict)], (cursor if has_more else None)
+def _walk_posts(obj, out, depth=0):
+    if depth > 14:
+        return
+    if isinstance(obj, dict):
+        surl = ""
+        for k in ("shorturl", "surl", "short_url"):
+            if isinstance(obj.get(k), str) and obj[k].strip():
+                surl = obj[k].strip()
+                break
+        if not surl:
+            for v in obj.values():
+                if isinstance(v, str):
+                    m = LINK_RE.search(v.replace("\\/", "/"))
+                    if m:
+                        surl = m.group(1)
+                        break
+        if surl:
+            out.append(obj)
+            return
+        for v in obj.values():
+            _walk_posts(v, out, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_posts(item, out, depth + 1)
 
 
-def posts_from_html(html: str):
-    """Fallback: pull share links straight out of an HTML page."""
+def _find_cursor(obj, depth=0):
+    """Return (cursor, has_more_flag)."""
+    if depth > 8:
+        return None, None
+    cursor, more = None, None
+    if isinstance(obj, dict):
+        for k in ("hasMore", "has_more", "hasmore"):
+            if k in obj:
+                more = bool(obj[k])
+        for k in ("cursor", "next_cursor", "nextCursor", "next", "offset"):
+            if obj.get(k) and isinstance(obj[k], (str, int)):
+                cursor = obj[k]
+                break
+        if cursor is None:
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    c, m = _find_cursor(v, depth + 1)
+                    cursor = cursor or c
+                    more = m if more is None else more
+    elif isinstance(obj, list):
+        for v in obj[:3]:
+            c, m = _find_cursor(v, depth + 1)
+            cursor = cursor or c
+            more = m if more is None else more
+    return cursor, more
+
+
+def _state_objects(html: str):
+    objs = []
+    dec = json.JSONDecoder()
+    for m in STATE_ASSIGN_RE.finditer(html):
+        i = m.end()
+        if i < len(html) and html[i] == "{":
+            try:
+                obj, _ = dec.raw_decode(html, i)
+                objs.append(obj)
+            except ValueError:
+                log.warning("Could not decode embedded state JSON")
+    for m in JSON_SCRIPT_RE.finditer(html):
+        try:
+            objs.append(json.loads(m.group(1).strip()))
+        except ValueError:
+            pass
+    return objs
+
+
+def _clean_html(html: str) -> str:
+    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<a\s[^>]*href=[\"']([^\"']+)[\"'][^>]*>", r" \1 ", html, flags=re.I)
+    html = re.sub(r"<br\s*/?>|</(p|div|li|h\d|section)>", "\n", html, flags=re.I)
+    html = re.sub(r"<[^>]+>", " ", html)
+    return unescape(html).replace("\\/", "/")
+
+
+def _posts_from_text(html: str):
+    """Regex fallback: share links plus the text just before each link."""
+    cleaned = _clean_html(html)
+    matches = list(LINK_RE.finditer(cleaned))
+    # links may also live inside script blobs / JSON strings
+    if not matches:
+        cleaned = unescape(html).replace("\\/", "/")
+        matches = list(LINK_RE.finditer(cleaned))
     posts, found = [], set()
-    for m in LINK_RE.finditer(html or ""):
+    for i, m in enumerate(matches):
         surl = m.group(1)
         if surl in found:
             continue
         found.add(surl)
-        posts.append({"id": f"html-{surl}", "shorturl": surl, "caption": ""})
+        start = max(matches[i - 1].end() if i else 0, m.start() - 400)
+        chunk = re.sub(r"https?://\S+", " ", cleaned[start:m.start()])
+        chunk = "\n".join(l.strip() for l in chunk.splitlines() if l.strip())
+        posts.append({"id": f"html-{surl}", "shorturl": surl, "caption": chunk[-300:]})
     return posts
 
 
-async def fetch_posts_page(http, channel: str, cursor):
-    params = {"channel_id": channel, "bot_uk": BOT_UK or channel, "num": 20}
-    if cursor:
-        params["cursor"] = cursor
-    data, raw = await safe_get(http, CHANNEL_API_URL, params)
-    if data is not None:
-        return extract_posts(data)
-    if raw and "<" in raw[:500]:
-        fallback = posts_from_html(raw)
-        log.info("HTML response; fallback share inspection found %s link(s)", len(fallback))
-        return fallback, None
-    return [], None
+def parse_response(text: str):
+    """Return (posts, cursor) from JSON, embedded state JSON, or raw HTML links."""
+    t = text.strip()
+    if t.startswith(("{", "[")):
+        try:
+            obj = json.loads(t)
+            out = []
+            _walk_posts(obj, out)
+            cursor, more = _find_cursor(obj)
+            return out, (cursor if more is not False else None)
+        except ValueError:
+            log.warning("JSON-looking response failed to parse; falling back to link regex")
+    posts, cursor = [], None
+    for obj in _state_objects(text):
+        out = []
+        _walk_posts(obj, out)
+        if out:
+            posts.extend(out)
+            c, more = _find_cursor(obj)
+            cursor = cursor or (c if more is not False else None)
+    if posts:
+        log.info("Extracted %s post(s) from embedded state JSON", len(posts))
+        return posts, cursor
+    posts = _posts_from_text(text)
+    log.info("Extracted %s post(s) via share-link regex fallback", len(posts))
+    return posts, None
 
 
 def post_fields(post: dict):
     post_id = str(post.get("id") or post.get("post_id") or post.get("msgid")
                   or post.get("feedid") or post.get("ctime") or "")
     text = ""
-    for k in ("caption", "content", "text", "title", "desc", "description"):
-        if post.get(k):
-            text = str(post[k])
+    for k in ("caption", "content", "text", "title", "desc", "description", "msg", "message"):
+        if isinstance(post.get(k), str) and post[k].strip():
+            text = post[k]
             break
-    shorturl = post.get("shorturl") or post.get("surl") or ""
+    shorturl = ""
+    for k in ("shorturl", "surl", "short_url"):
+        if isinstance(post.get(k), str) and post[k].strip():
+            shorturl = post[k].strip()
+            break
     if not shorturl:
-        m = LINK_RE.search(text) or LINK_RE.search(str(post))
+        m = LINK_RE.search(str(post).replace("\\/", "/"))
         if m:
             shorturl = m.group(1)
-    return post_id, text.strip(), str(shorturl).strip()
+    return post_id, text.strip(), shorturl
+
+
+# ---------------- FOLDER TRAVERSAL ----------------
+async def safe_get_json(http: httpx.AsyncClient, url: str, params: dict):
+    for attempt in range(3):
+        try:
+            res = await http.get(url, params=params, headers=API_HEADERS)
+            body = res.text or ""
+            if res.status_code == 200 and body.strip().startswith(("{", "[")):
+                return res.json()
+            log.warning("Non-JSON/HTTP %s from %s: %r", res.status_code, url, body[:100])
+            if res.status_code == 200:
+                return None
+        except Exception as e:
+            log.warning("Request failed (%s): %s", attempt + 1, e)
+        await asyncio.sleep(2 * (attempt + 1))
+    return None
 
 
 async def list_dir(http, shorturl: str, path):
@@ -218,7 +342,7 @@ async def list_dir(http, shorturl: str, path):
         params.update({"dir": path, "root": "0"})
     else:
         params["root"] = "1"
-    data, _ = await safe_get(http, SHARE_LIST_URL, params)
+    data = await safe_get_json(http, SHARE_LIST_URL, params)
     if not isinstance(data, dict) or data.get("errno", 0) != 0:
         return []
     return data.get("list") or []
@@ -251,7 +375,9 @@ def classify(text: str, files: list) -> str:
 
 
 def build_caption(text: str, files: list, shorturl: str, category: str) -> str:
-    title = escape((text.splitlines()[0] if text else (files[0] if files else "Untitled"))[:200])
+    plain = re.sub(r"https?://\S+", "", text).strip()
+    first = plain.splitlines()[0] if plain else (files[0] if files else "Untitled")
+    title = escape(first[:200])
     preview = "\n".join(f"• <code>{escape(f[:90])}</code>" for f in files[:10]) or "• No video files found"
     more = f"\n… and {len(files) - 10} more" if len(files) > 10 else ""
     link = f"https://terabox.com/s/{shorturl}" if shorturl else "N/A"
@@ -264,11 +390,8 @@ def build_caption(text: str, files: list, shorturl: str, category: str) -> str:
     )[:4000]
 
 
-# ---------------- TELEGRAM ----------------
+# ---------------- TELEGRAM SENDING ----------------
 async def send_via_bot_api(chat_id, text: str) -> bool:
-    """Fallback that needs no access_hash/peer cache: plain Bot API."""
-    if BOT_HTTP is None:
-        return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
                "disable_web_page_preview": True}
@@ -283,8 +406,8 @@ async def send_via_bot_api(chat_id, text: str) -> bool:
                 log.warning("Bot API flood wait %ss", wait)
                 await asyncio.sleep(wait + 1)
                 continue
-            log.error("Bot API send to %s failed: %s (bot must be admin of the channel "
-                      "and the ID must be correct)", chat_id, data.get("description"))
+            log.error("Bot API send to %s failed: %s (bot must be admin there and the ID correct)",
+                      chat_id, data.get("description"))
             return False
         except Exception as e:
             log.error("Bot API request error: %s", e)
@@ -292,40 +415,50 @@ async def send_via_bot_api(chat_id, text: str) -> bool:
     return False
 
 
-async def send(app: Client, chat_id, text: str) -> bool:
-    for _ in range(3):
-        try:
-            await app.send_message(chat_id, text, disable_web_page_preview=True)
-            return True
-        except FloodWait as e:
-            log.warning("FloodWait %ss", e.value)
-            await asyncio.sleep(e.value + 1)
-        except Exception as e:
-            log.warning("Pyrogram send to %s failed (%s); trying Bot API fallback", chat_id, e)
-            return await send_via_bot_api(chat_id, text)
-    return False
+async def send(app, chat_id, text: str) -> bool:
+    """Pyrogram only if it resolved this chat; otherwise Bot API is the primary sender."""
+    if app is not None and chat_id in PYRO_OK:
+        for _ in range(3):
+            try:
+                await app.send_message(chat_id, text, disable_web_page_preview=True)
+                return True
+            except FloodWait as e:
+                log.warning("FloodWait %ss", e.value)
+                await asyncio.sleep(e.value + 1)
+            except Exception as e:
+                log.warning("Pyrogram send to %s failed (%s); using Bot API", chat_id, e)
+                break
+    return await send_via_bot_api(chat_id, text)
 
 
-async def report(app: Client, text: str):
+async def report(app, text: str):
     await send(app, LOG_CHANNEL, f"ℹ️ {escape(text)}")
 
 
 # ---------------- PROCESSING ----------------
-async def process_channel(app: Client, http: httpx.AsyncClient, channel: str):
-    sent = 0
-    cursor = None
-    await report(app, f"Scanning channel {channel}")
-    for _page in range(1, MAX_PAGES + 1):
-        posts, cursor = await fetch_posts_page(http, channel, cursor)
-        if not posts:
+async def process_channel(app, http: httpx.AsyncClient, bot_uk: str):
+    sent, cursor, prev_sig = 0, None, None
+    await report(app, f"Scanning bot_uk {bot_uk}")
+    for page in range(1, MAX_PAGES + 1):
+        text = await fetch_page(http, bot_uk, page, cursor)
+        if not text:
             break
+        posts, next_cursor = parse_response(text)
+        if not posts:
+            log.info("No posts on page %s for bot_uk=%s", page, bot_uk)
+            break
+
+        sig = tuple(sorted(post_fields(p)[2] or post_fields(p)[0] for p in posts))
+        if sig == prev_sig:  # pagination returned the same content again
+            break
+        prev_sig = sig
 
         new_on_page = 0
         for post in posts:
-            post_id, text, shorturl = post_fields(post)
+            post_id, ptext, shorturl = post_fields(post)
             if not post_id and not shorturl:
                 continue
-            post_key = f"post:{channel}:{post_id}"
+            post_key = f"post:{bot_uk}:{post_id}"
             surl_key = f"surl:{shorturl}"
             if (post_id and seen(post_key)) or (shorturl and seen(surl_key)):
                 continue
@@ -333,8 +466,8 @@ async def process_channel(app: Client, http: httpx.AsyncClient, channel: str):
 
             try:
                 files = await collect_videos(http, shorturl) if shorturl else []
-                category = classify(text, files)
-                caption = build_caption(text, files, shorturl, category)
+                category = classify(ptext, files)
+                caption = build_caption(ptext, files, shorturl, category)
                 target = {"ADULT": ADULT_CHANNEL, "MOVIES": MOVIES_CHANNEL}.get(category, LOG_CHANNEL)
                 if await send(app, target, caption):
                     if post_id:
@@ -344,23 +477,24 @@ async def process_channel(app: Client, http: httpx.AsyncClient, channel: str):
                     sent += 1
             except Exception as e:
                 log.exception("Post failed")
-                await report(app, f"Error on {channel}/{post_id}: {e}")
+                await report(app, f"Error on {bot_uk}/{post_id}: {e}")
             await asyncio.sleep(3)
 
-        if new_on_page == 0 or not cursor:
+        if new_on_page == 0:
             break
-    await report(app, f"Channel {channel} done. Dispatched: {sent}")
+        cursor = next_cursor
+    await report(app, f"bot_uk {bot_uk} done. Dispatched: {sent}")
 
 
-async def worker(app: Client, http: httpx.AsyncClient):
+async def worker(app, http: httpx.AsyncClient):
     while True:
-        for ch in TARGET_CHANNELS:
+        for uk in TARGET_CHANNELS:
             try:
-                await process_channel(app, http, ch)
+                await process_channel(app, http, uk)
             except Exception as e:
-                log.exception("Channel %s failed", ch)
+                log.exception("Channel %s failed", uk)
                 try:
-                    await report(app, f"Channel {ch} crashed: {e}")
+                    await report(app, f"Channel {uk} crashed: {e}")
                 except Exception:
                     pass
         log.info("Cycle complete. Sleeping %ss", CHECK_INTERVAL)
@@ -371,19 +505,23 @@ async def main():
     global BOT_HTTP
     await start_web()
     BOT_HTTP = httpx.AsyncClient(timeout=30)
-    app = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
-    await app.start()
 
-    # Resolve each destination independently; one failure never stops the rest.
-    for name, cid in (("MOVIES_CHANNEL", MOVIES_CHANNEL),
-                      ("ADULT_CHANNEL", ADULT_CHANNEL),
-                      ("LOG_CHANNEL", LOG_CHANNEL)):
-        try:
-            chat = await app.get_chat(cid)
-            log.info("%s resolved: %s (%s)", name, chat.title, cid)
-        except Exception as e:
-            log.warning("%s (%s) not resolvable via Pyrogram: %s. Bot API fallback will be used; "
-                        "make sure the bot is admin there.", name, cid, e)
+    app = None
+    try:
+        app = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+        await app.start()
+        for name, cid in (("MOVIES_CHANNEL", MOVIES_CHANNEL),
+                          ("ADULT_CHANNEL", ADULT_CHANNEL),
+                          ("LOG_CHANNEL", LOG_CHANNEL)):
+            try:
+                chat = await app.get_chat(cid)
+                PYRO_OK.add(cid)
+                log.info("%s resolved via Pyrogram: %s (%s)", name, chat.title, cid)
+            except Exception as e:
+                log.warning("%s (%s) not resolvable via Pyrogram (%s) -> using Bot API", name, cid, e)
+    except Exception as e:
+        log.error("Pyrogram start failed (%s). Running with Bot API sender only.", e)
+        app = None
 
     await report(app, "Bot started")
     try:
@@ -391,7 +529,8 @@ async def main():
             await worker(app, http)
     finally:
         await BOT_HTTP.aclose()
-        await app.stop()
+        if app is not None:
+            await app.stop()
 
 
 if __name__ == "__main__":
