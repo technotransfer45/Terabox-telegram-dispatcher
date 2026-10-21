@@ -50,6 +50,7 @@ TARGET_CHANNELS = [clean_uk(c) for c in _raw.split(",") if clean_uk(c)] or ["440
 
 HIVE_URL = os.environ.get("HIVE_URL", "https://dm.nephobox.com/wap/hive/channelShare")
 SHARE_LIST_URL = "https://www.terabox.com/share/list"
+SHARE_BASE = "https://1024terabox.com/s/"
 APP_ID = "250528"
 
 CHECK_INTERVAL = 15 * 60
@@ -84,21 +85,38 @@ MOVIE_KEYWORDS = [
     "x264", "x265", "hevc", "dual audio", "hindi dubbed",
 ]
 MOVIE_REGEXES = [re.compile(r"\bs\d{1,2}(e\d{1,2})?\b", re.I)]
+VIDEO_EXT = (".mp4", ".mkv")
 
+# ---- parsing patterns ----
 LINK_RE = re.compile(
     r"https?://(?:[\w-]+\.)*(?:terabox|teraboxapp|nephobox|1024tera|1024terabox|4funbox|mirrobox|"
     r"momerybox|teraboxlink|terafileshare|terasharefile|terasharelink|tibibox|freeterabox)"
     r"\.[a-z]+/(?:s/|sharing/link\?surl=)([\w-]+)",
     re.I,
 )
-VIDEO_EXT = (".mp4", ".mkv")
+SPATH_RE = re.compile(r"/s/(1[\w-]{10,})")
+KEYED_SURL_RE = re.compile(
+    r"""(?:shorturl|surl|short_url)["']?\s*[:=]\s*["'](1?[\w-]{10,40})["']""", re.I
+)
+LOOSE_SURL_RE = re.compile(r"""["'](1[a-zA-Z0-9_\-]{20,30})["']""")
+CODE_OK_RE = re.compile(r"^[\w-]{10,40}$")
 
-STATE_ASSIGN_RE = re.compile(
-    r"window\.__(?:INITIAL_STATE|PRELOADED_STATE|NUXT|APP_STATE|DATA)__\s*=\s*", re.I
+SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.S | re.I)
+ASSIGN_RE = re.compile(
+    r"(?:window\.[\w$.]+|(?:var|let|const)\s+[\w$]*(?:state|data|initial|preload|store|channel|hive|msg)[\w$]*)"
+    r"\s*=\s*",
+    re.I,
 )
-JSON_SCRIPT_RE = re.compile(
-    r"<script[^>]*type=[\"']application/(?:json|ld\+json)[\"'][^>]*>(.*?)</script>", re.S | re.I
+JSON_PARSE_RE = re.compile(r"JSON\.parse\(\s*(['\"])((?:\\.|(?!\1).)*)\1\s*\)", re.S)
+KEY_RE = re.compile(r'"(msg_list|channel_msg|shorturl|surl)"\s*:\s*')
+KEY_PRESENT_RE = re.compile(r'"(?:msg_list|channel_msg|shorturl|surl)"')
+TEXT_FIELD_RE = re.compile(
+    r"""["'](?:caption|content|text|title|desc|description|msg|message)["']\s*:\s*"((?:[^"\\]|\\.){3,600})\"""",
+    re.I,
 )
+TEXT_KEYS = ("caption", "content", "text", "title", "desc", "description", "msg", "message")
+ID_KEYS = ("msgid", "msg_id", "id", "post_id", "feedid", "ctime")
+SURL_KEYS = ("shorturl", "surl", "short_url")
 NOT_FOUND_MARKERS = ("can’t find the page", "can't find the page", "page not found")
 
 BOT_HTTP = None
@@ -134,7 +152,7 @@ async def start_web():
     log.info("Health server on port %s", PORT)
 
 
-# ---------------- PAGE FETCH + PARSING ----------------
+# ---------------- PAGE FETCH ----------------
 async def fetch_page(http: httpx.AsyncClient, bot_uk: str, page: int, cursor):
     """Fetch the Hive channel page (or its paginated variant). Returns text or None."""
     params = {"bot_uk": bot_uk}
@@ -166,30 +184,64 @@ async def fetch_page(http: httpx.AsyncClient, bot_uk: str, page: int, cursor):
     return None
 
 
-def _walk_posts(obj, out, depth=0):
-    if depth > 14:
+# ---------------- STATE / POST EXTRACTION ----------------
+def _own_text(d: dict) -> str:
+    for k in TEXT_KEYS:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
+def _own_id(d: dict) -> str:
+    for k in ID_KEYS:
+        if d.get(k):
+            return str(d[k])
+    return ""
+
+
+def _codes_in_dict(d: dict):
+    """Share codes found directly in this dict (keys + string values)."""
+    codes = []
+    for k in SURL_KEYS:
+        v = d.get(k)
+        if isinstance(v, str) and CODE_OK_RE.match(v.strip()):
+            codes.append(v.strip())
+    for v in d.values():
+        if isinstance(v, str) and len(v) < 5000:
+            vv = v.replace("\\/", "/")
+            codes.extend(m.group(1) for m in LINK_RE.finditer(vv))
+            codes.extend(m.group(1) for m in SPATH_RE.finditer(vv))
+    return codes
+
+
+def _walk_posts(obj, out, depth=0, ctx_text="", ctx_id=""):
+    """Collect posts; child dicts inherit the parent's caption/id."""
+    if depth > 16:
         return
     if isinstance(obj, dict):
-        surl = ""
-        for k in ("shorturl", "surl", "short_url"):
-            if isinstance(obj.get(k), str) and obj[k].strip():
-                surl = obj[k].strip()
-                break
-        if not surl:
-            for v in obj.values():
-                if isinstance(v, str):
-                    m = LINK_RE.search(v.replace("\\/", "/"))
-                    if m:
-                        surl = m.group(1)
-                        break
-        if surl:
-            out.append(obj)
-            return
+        text = _own_text(obj) or ctx_text
+        pid = _own_id(obj) or ctx_id
+        for code in _codes_in_dict(obj):
+            out.append({"id": f"{pid}:{code}" if pid else f"s-{code}",
+                        "shorturl": code, "caption": text})
         for v in obj.values():
-            _walk_posts(v, out, depth + 1)
+            if isinstance(v, (dict, list)):
+                _walk_posts(v, out, depth + 1, text, pid)
     elif isinstance(obj, list):
         for item in obj:
-            _walk_posts(item, out, depth + 1)
+            _walk_posts(item, out, depth + 1, ctx_text, ctx_id)
+
+
+def dedupe_posts(posts):
+    best = {}
+    for p in posts:
+        code = p.get("shorturl")
+        if not code:
+            continue
+        if code not in best or len(p.get("caption", "")) > len(best[code].get("caption", "")):
+            best[code] = p
+    return list(best.values())
 
 
 def _find_cursor(obj, depth=0):
@@ -219,25 +271,101 @@ def _find_cursor(obj, depth=0):
     return cursor, more
 
 
-def _state_objects(html: str):
-    objs = []
+def _objs_around_keys(body: str):
+    """Find JSON objects/arrays around msg_list / channel_msg / shorturl / surl keys."""
+    objs, spans = [], []
     dec = json.JSONDecoder()
-    for m in STATE_ASSIGN_RE.finditer(html):
-        i = m.end()
-        if i < len(html) and html[i] == "{":
-            try:
-                obj, _ = dec.raw_decode(html, i)
-                objs.append(obj)
-            except ValueError:
-                log.warning("Could not decode embedded state JSON")
-    for m in JSON_SCRIPT_RE.finditer(html):
-        try:
-            objs.append(json.loads(m.group(1).strip()))
-        except ValueError:
-            pass
+    for m in KEY_RE.finditer(body):
+        pos = m.start()
+        if any(a <= pos < b for a, b in spans):
+            continue
+        key, i = m.group(1), m.end()
+        if key in ("msg_list", "channel_msg"):
+            if i < len(body) and body[i] in "[{":
+                try:
+                    obj, end = dec.raw_decode(body, i)
+                    objs.append(obj)
+                    spans.append((i, end))
+                except ValueError:
+                    pass
+            continue
+        depth, j, tries = 0, pos, 0
+        while j > 0 and pos - j < 6000 and tries < 4:
+            j -= 1
+            c = body[j]
+            if c == "}":
+                depth += 1
+            elif c == "{":
+                if depth == 0:
+                    try:
+                        obj, end = dec.raw_decode(body, j)
+                        objs.append(obj)
+                        spans.append((j, end))
+                        break
+                    except ValueError:
+                        tries += 1
+                else:
+                    depth -= 1
     return objs
 
 
+def _decode_js_string(quote: str, body: str):
+    try:
+        if quote == '"':
+            return json.loads('"' + body + '"')
+        s = body.replace("\\'", "'")
+        s = re.sub(r'(?<!\\)"', r'\\"', s)
+        return json.loads('"' + s + '"')
+    except ValueError:
+        return None
+
+
+def _objs_from_script(body: str):
+    objs = []
+    dec = json.JSONDecoder()
+    s = body.strip()
+    if s[:1] in ("{", "["):
+        try:
+            return [json.loads(s)]
+        except ValueError:
+            pass
+    # window.__INITIAL_STATE__ = {...}; window.__DATA__ = {...}; var xState = {...}
+    for m in ASSIGN_RE.finditer(body):
+        i = m.end()
+        if i < len(body) and body[i] in "{[":
+            try:
+                obj, _ = dec.raw_decode(body, i)
+                objs.append(obj)
+            except ValueError:
+                pass
+    # window.__X__ = JSON.parse('...')
+    for m in JSON_PARSE_RE.finditer(body):
+        decoded = _decode_js_string(m.group(1), m.group(2))
+        if decoded:
+            try:
+                objs.append(json.loads(decoded))
+            except ValueError:
+                pass
+    if not objs and KEY_PRESENT_RE.search(body):
+        objs.extend(_objs_around_keys(body))
+    return objs
+
+
+def _state_objects(html: str):
+    objs = []
+    for _attrs, body in SCRIPT_RE.findall(html):
+        if len(body.strip()) < 30:
+            continue
+        found = _objs_from_script(body)
+        if not found and re.search(r'\\"(?:msg_list|channel_msg|shorturl|surl)\\"', body):
+            found = _objs_from_script(body.replace('\\"', '"').replace("\\\\", "\\"))
+        objs.extend(found)
+    if not objs and KEY_PRESENT_RE.search(html):
+        objs.extend(_objs_around_keys(html))
+    return objs
+
+
+# ---------------- FALLBACK LINK EXTRACTOR ----------------
 def _clean_html(html: str) -> str:
     html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
     html = re.sub(r"<a\s[^>]*href=[\"']([^\"']+)[\"'][^>]*>", r" \1 ", html, flags=re.I)
@@ -246,29 +374,91 @@ def _clean_html(html: str) -> str:
     return unescape(html).replace("\\/", "/")
 
 
-def _posts_from_text(html: str):
-    """Regex fallback: share links plus the text just before each link."""
+def _posts_from_visible_html(html: str):
     cleaned = _clean_html(html)
     matches = list(LINK_RE.finditer(cleaned))
-    # links may also live inside script blobs / JSON strings
-    if not matches:
-        cleaned = unescape(html).replace("\\/", "/")
-        matches = list(LINK_RE.finditer(cleaned))
     posts, found = [], set()
     for i, m in enumerate(matches):
-        surl = m.group(1)
-        if surl in found:
+        code = m.group(1)
+        if code in found:
             continue
-        found.add(surl)
+        found.add(code)
         start = max(matches[i - 1].end() if i else 0, m.start() - 400)
         chunk = re.sub(r"https?://\S+", " ", cleaned[start:m.start()])
         chunk = "\n".join(l.strip() for l in chunk.splitlines() if l.strip())
-        posts.append({"id": f"html-{surl}", "shorturl": surl, "caption": chunk[-300:]})
+        posts.append({"id": f"html-{code}", "shorturl": code, "caption": chunk[-300:]})
     return posts
 
 
+def _context_text(blob: str, pos: int) -> str:
+    lo = max(0, pos - 800)
+    window = blob[lo:pos + 800]
+    best, best_d = "", None
+    for m in TEXT_FIELD_RE.finditer(window):
+        d = abs((lo + m.start()) - pos)
+        if best_d is None or d < best_d:
+            raw = m.group(1)
+            try:
+                raw = json.loads('"' + raw + '"')
+            except ValueError:
+                pass
+            best, best_d = raw, d
+    return best
+
+
+def _plausible_loose(code: str) -> bool:
+    has_letter = any(c.isalpha() for c in code)
+    mixed = any(c.isupper() for c in code) and any(c.islower() for c in code)
+    return has_letter and (mixed or "-" in code or "_" in code)
+
+
+def fallback_links(html: str):
+    """Tiered extraction: visible links -> /s/ codes -> keyed surl -> loose quoted codes."""
+    posts = _posts_from_visible_html(html)
+    if posts:
+        log.info("Fallback tier 'visible links': %s code(s)", len(posts))
+        return posts
+
+    blob = html.replace("\\/", "/")
+    found = {}
+    counts = {}
+    for tier, rx in (("full-url", LINK_RE), ("/s/ path", SPATH_RE), ("keyed surl", KEYED_SURL_RE)):
+        n = 0
+        for m in rx.finditer(blob):
+            code = m.group(1)
+            if code not in found:
+                found[code] = _context_text(blob, m.start())
+                n += 1
+        counts[tier] = n
+    if not found:
+        n = 0
+        for m in LOOSE_SURL_RE.finditer(blob):
+            code = m.group(1)
+            if code not in found and _plausible_loose(code):
+                found[code] = _context_text(blob, m.start())
+                n += 1
+        counts["loose quoted"] = n
+    log.info("Fallback link extractor counts: %s", counts)
+    return [{"id": f"html-{c}", "shorturl": c, "caption": t} for c, t in found.items()]
+
+
+def debug_dump(html: str):
+    scripts = SCRIPT_RE.findall(html)
+    inline = [b for a, b in scripts if "src=" not in a.lower()]
+    log.error("0 posts extracted. HTML first 500 chars: %r", html[:500])
+    log.error("Script tags: total=%s, with src=%s, inline=%s",
+              len(scripts), len(scripts) - len(inline), len(inline))
+    for b in sorted(inline, key=len, reverse=True)[:5]:
+        log.error("  inline script %s chars: %r", len(b), b.strip()[:150])
+    keys = {k: html.count(k) for k in ("shorturl", "surl", "msg_list", "channel_msg", "__INITIAL_STATE__", "__DATA__")}
+    log.error("Key counts in HTML: %s", keys)
+    paths = re.findall(r"""["'](/(?:api|wap)/[\w/\-.]*(?:hive|channel|msg|share)[\w/\-.]*)["']""", html)
+    uniq = list(dict.fromkeys(paths))[:20]
+    log.error("Candidate API paths found in scripts: %s", uniq)
+
+
 def parse_response(text: str):
-    """Return (posts, cursor) from JSON, embedded state JSON, or raw HTML links."""
+    """Return (posts, cursor) from JSON, embedded script state, or link fallbacks."""
     t = text.strip()
     if t.startswith(("{", "[")):
         try:
@@ -276,22 +466,29 @@ def parse_response(text: str):
             out = []
             _walk_posts(obj, out)
             cursor, more = _find_cursor(obj)
-            return out, (cursor if more is not False else None)
+            posts = dedupe_posts(out)
+            if posts:
+                return posts, (cursor if more is not False else None)
         except ValueError:
-            log.warning("JSON-looking response failed to parse; falling back to link regex")
-    posts, cursor = [], None
-    for obj in _state_objects(text):
-        out = []
+            log.warning("JSON-looking response failed to parse; using fallbacks")
+
+    objs = _state_objects(text)
+    out, cursor = [], None
+    for obj in objs:
         _walk_posts(obj, out)
-        if out:
-            posts.extend(out)
-            c, more = _find_cursor(obj)
-            cursor = cursor or (c if more is not False else None)
+        c, more = _find_cursor(obj)
+        if cursor is None and c and more is not False:
+            cursor = c
+    posts = dedupe_posts(out)
     if posts:
-        log.info("Extracted %s post(s) from embedded state JSON", len(posts))
+        log.info("Extracted %s post(s) from script state JSON (%s object(s) parsed)", len(posts), len(objs))
         return posts, cursor
-    posts = _posts_from_text(text)
-    log.info("Extracted %s post(s) via share-link regex fallback", len(posts))
+
+    posts = fallback_links(text)
+    if not posts:
+        debug_dump(text)
+    else:
+        log.info("Extracted %s post(s) via fallback link extractor", len(posts))
     return posts, None
 
 
@@ -299,12 +496,12 @@ def post_fields(post: dict):
     post_id = str(post.get("id") or post.get("post_id") or post.get("msgid")
                   or post.get("feedid") or post.get("ctime") or "")
     text = ""
-    for k in ("caption", "content", "text", "title", "desc", "description", "msg", "message"):
+    for k in ("caption",) + TEXT_KEYS:
         if isinstance(post.get(k), str) and post[k].strip():
             text = post[k]
             break
     shorturl = ""
-    for k in ("shorturl", "surl", "short_url"):
+    for k in SURL_KEYS:
         if isinstance(post.get(k), str) and post[k].strip():
             shorturl = post[k].strip()
             break
@@ -380,7 +577,7 @@ def build_caption(text: str, files: list, shorturl: str, category: str) -> str:
     title = escape(first[:200])
     preview = "\n".join(f"• <code>{escape(f[:90])}</code>" for f in files[:10]) or "• No video files found"
     more = f"\n… and {len(files) - 10} more" if len(files) > 10 else ""
-    link = f"https://terabox.com/s/{shorturl}" if shorturl else "N/A"
+    link = f"{SHARE_BASE}{shorturl}" if shorturl else "N/A"
     return (
         f"🎬 <b>{title}</b>\n\n"
         f"📁 <b>Files:</b>\n{preview}{more}\n\n"
@@ -446,6 +643,8 @@ async def process_channel(app, http: httpx.AsyncClient, bot_uk: str):
         posts, next_cursor = parse_response(text)
         if not posts:
             log.info("No posts on page %s for bot_uk=%s", page, bot_uk)
+            if page == 1:
+                await report(app, f"bot_uk {bot_uk}: 0 posts extracted (see server logs for debug dump)")
             break
 
         sig = tuple(sorted(post_fields(p)[2] or post_fields(p)[0] for p in posts))
